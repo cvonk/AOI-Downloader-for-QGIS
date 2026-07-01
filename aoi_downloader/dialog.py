@@ -7,25 +7,29 @@ the chosen layer, and the relevant parameter fields are shown: tile size +
 resolution for WMS, zoom level for XYZ.
 """
 
+import math
+
 from qgis.PyQt.QtWidgets import (
     QDialog, QFormLayout, QVBoxLayout, QHBoxLayout, QDialogButtonBox,
     QSpinBox, QDoubleSpinBox, QLabel, QWidget, QLineEdit, QToolButton,
-    QMenu, QFileDialog,
+    QMenu, QFileDialog, QMessageBox,
 )
 from qgis.core import (
     QgsProject, QgsMapLayerProxyModel, QgsRasterLayer, QgsSettings,
-    QgsCoordinateReferenceSystem,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform,
 )
 from qgis.gui import QgsMapLayerComboBox, QgsProjectionSelectionWidget
 
-from . import engine
-from .sources import xyz
+from . import engine, tilemath
 
 SETTINGS_GROUP = "aoi_downloader"
 
 DEFAULT_TILE_PIXELS = 1024
 DEFAULT_RESOLUTION  = 0.5
 DEFAULT_ZOOM        = 18
+
+# Ask for confirmation above this estimated tile count.
+WARN_TILE_COUNT = 5000
 
 
 class OutputDestinationWidget(QWidget):
@@ -96,28 +100,36 @@ class AoiDialog(QDialog):
 
         self.aoi_combo = QgsMapLayerComboBox()
         self.aoi_combo.setFilters(QgsMapLayerProxyModel.PolygonLayer)
+        self.aoi_combo.layerChanged.connect(self._update_estimate)
         form.addRow("AOI polygon layer:", self.aoi_combo)
 
         # WMS-only rows ------------------------------------------------------
         self.tile_lbl  = QLabel("Tile size (px):")
         self.tile_spin = QSpinBox(); self.tile_spin.setRange(256, 8192)
         self.tile_spin.setSingleStep(256)
+        self.tile_spin.valueChanged.connect(self._update_estimate)
         form.addRow(self.tile_lbl, self.tile_spin)
 
         self.res_lbl  = QLabel("Resolution (units/px):")
         self.res_spin = QDoubleSpinBox(); self.res_spin.setDecimals(3)
         self.res_spin.setRange(0.001, 1000.0); self.res_spin.setSingleStep(0.1)
+        self.res_spin.valueChanged.connect(self._update_estimate)
         form.addRow(self.res_lbl, self.res_spin)
 
         # XYZ-only rows ------------------------------------------------------
         self.zoom_lbl  = QLabel("Zoom level:")
         self.zoom_spin = QSpinBox(); self.zoom_spin.setRange(0, 22)
         self.zoom_spin.valueChanged.connect(self._update_zoom_label)
+        self.zoom_spin.valueChanged.connect(self._update_estimate)
         form.addRow(self.zoom_lbl, self.zoom_spin)
 
         self.zoom_res_lbl  = QLabel("")
         self.zoom_res_info = QLabel("")
         form.addRow(self.zoom_res_lbl, self.zoom_res_info)
+
+        # Estimated tile count (updates live) --------------------------------
+        self.estimate_lbl = QLabel("")
+        form.addRow("", self.estimate_lbl)
 
         # Common -------------------------------------------------------------
         self.crs_widget = QgsProjectionSelectionWidget()
@@ -142,6 +154,7 @@ class AoiDialog(QDialog):
 
         self._restore_state()
         self._on_layer_changed()
+        self._update_estimate()
 
     # ── filtering / visibility ────────────────────────────────────────────────
     def _restrict_to_sources(self):
@@ -177,10 +190,60 @@ class AoiDialog(QDialog):
             except Exception:
                 pass
         self._last_source = name
+        self._update_estimate()
 
     def _update_zoom_label(self, *args):
         self.zoom_res_info.setText(
-            f"≈ {xyz.tile_resolution_m(self.zoom_spin.value()):.3f} m/px at the equator")
+            f"≈ {tilemath.tile_resolution_m(self.zoom_spin.value()):.3f} m/px at the equator")
+
+    # ── tile-count estimate ───────────────────────────────────────────────────
+    def _aoi_bbox_in(self, aoi, target_crs):
+        """The AOI layer's extent, reprojected to target_crs. None on failure."""
+        try:
+            ext = aoi.extent()
+            if aoi.crs() == target_crs:
+                return ext
+            xform = QgsCoordinateTransform(
+                aoi.crs(), target_crs, QgsProject.instance().transformContext())
+            return xform.transformBoundingBox(ext)
+        except Exception:
+            return None
+
+    def _estimate_tiles(self):
+        """Upper-bound tile count over the AOI bounding box (no polygon
+        intersection), or None if it can't be computed yet."""
+        layer = self.layer_combo.currentLayer()
+        aoi   = self.aoi_combo.currentLayer()
+        name  = self._current_source_name()
+        if layer is None or aoi is None or name is None:
+            return None
+        try:
+            if name == "XYZ":
+                bb = self._aoi_bbox_in(aoi, QgsCoordinateReferenceSystem("EPSG:3857"))
+                if bb is None:
+                    return None
+                xmin, xmax, ymin, ymax = tilemath.tile_range(
+                    bb.xMinimum(), bb.yMinimum(), bb.xMaximum(), bb.yMaximum(),
+                    self.zoom_spin.value())
+                return (xmax - xmin + 1) * (ymax - ymin + 1)
+            if name == "WMS":
+                params = engine.source_for(layer).extract_params(layer)   # no network
+                bb = self._aoi_bbox_in(aoi, QgsCoordinateReferenceSystem(params["crs"]))
+                if bb is None:
+                    return None
+                step = self.tile_spin.value() * self.res_spin.value()
+                if step <= 0:
+                    return None
+                return (max(1, math.ceil(bb.width() / step)) *
+                        max(1, math.ceil(bb.height() / step)))
+        except Exception:
+            return None
+        return None
+
+    def _update_estimate(self, *args):
+        n = self._estimate_tiles()
+        self.estimate_lbl.setText(
+            "" if n is None else f"≈ {n:,} tiles (bounding-box estimate)")
 
     # ── settings persistence ──────────────────────────────────────────────────
     def _restore_state(self):
@@ -229,6 +292,15 @@ class AoiDialog(QDialog):
         s.setValue(f"{g}/aoi_layer_id", al.id() if al else "")
 
     def accept(self):
+        n = self._estimate_tiles()
+        if n and n > WARN_TILE_COUNT:
+            reply = QMessageBox.question(
+                self, "Large download",
+                f"This will download roughly {n:,} tiles, which may be slow and "
+                f"put load on the server.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return          # keep the dialog open
         self._save_state()
         super().accept()
 
