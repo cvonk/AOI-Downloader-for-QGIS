@@ -3,18 +3,22 @@ name=Basemap Tile Downloader
 qgisMinimumVersion=3.16
 description=Download a WMS, WMTS, or XYZ basemap over an extent and mosaic it into a GeoTIFF.
 about=Auto-detects whether the chosen layer is a WMS, WMTS, or XYZ tile source. Tiles the request over a chosen extent (WMS GetMap at a chosen resolution/CRS, or WMTS / Web-Mercator {z}/{x}/{y} at a chosen zoom), downloads with adaptive throttling and a resumable SQLite work queue, georeferences each tile, and builds a compressed, tiled GeoTIFF mosaic (with overviews) using GDAL. Optionally reprojects to a chosen output CRS and crops to the exact extent. Requires the GDAL Python bindings.
-version=1.1.1
+version=1.2.0
 author=Coert Vonk
 email=coert.vonk@gmail.com
-tracker=https://github.com/cvonk/AOI-Downloader-for-QGIS/issues
-repository=https://github.com/cvonk/AOI-Downloader-for-QGIS
-homepage=https://github.com/cvonk/AOI-Downloader-for-QGIS
+tracker=https://github.com/cvonk/Basemap-Tile-Downloader/issues
+repository=https://github.com/cvonk/Basemap-Tile-Downloader
+homepage=https://github.com/cvonk/Basemap-Tile-Downloader
 icon=icon.svg
 experimental=False
 deprecated=False
 category=Web
 tags=wms,wmts,xyz,tiles,download,raster,mosaic,gdal,basemap,orthophoto,aoi,web mercator
-changelog=1.1.1 - Terms-of-Service reminder on large downloads; XYZ resolution
+changelog=1.2.0 - Renamed to Basemap Tile Downloader. Download area is now a
+    rectangular extent selector (was an AOI polygon layer). Configurable parallel
+    downloads and max attempts in a collapsible Advanced section; re-runs retry
+    previously-failed tiles.
+    1.1.1 - Terms-of-Service reminder on large downloads; XYZ resolution
     label reported at the AOI latitude.
     1.1.0 - WMTS source backend; optional clip-to-AOI-polygon (cutline);
     release-zip automation; ruff lint and more unit tests.

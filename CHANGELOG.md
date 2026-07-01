@@ -4,9 +4,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+## [1.2.0] - 2026-07-01
 ### Changed
 - **Renamed the plugin to "Basemap Tile Downloader"** (menu, metadata, log tab).
-  The Python package and repository names are unchanged.
+  The Python package folder (`aoi_downloader`) is unchanged; the repository was
+  renamed to `Basemap-Tile-Downloader`.
 - **The download area is now a rectangular extent instead of an AOI polygon
   layer.** The dialog uses an extent selector (Calculate from Layer / Use
   Current Map Canvas Extent / Draw on Canvas), like QGIS's "Convert Map to

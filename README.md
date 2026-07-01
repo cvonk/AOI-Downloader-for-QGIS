@@ -1,6 +1,6 @@
 # Basemap Tile Downloader for QGIS
 
-[![CI](https://github.com/cvonk/AOI-Downloader-for-QGIS/actions/workflows/ci.yml/badge.svg)](https://github.com/cvonk/AOI-Downloader-for-QGIS/actions/workflows/ci.yml)
+[![CI](https://github.com/cvonk/Basemap-Tile-Downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/cvonk/Basemap-Tile-Downloader/actions/workflows/ci.yml)
 
 A QGIS plugin that exports a high-resolution GeoTIFF from a **WMS**, **WMTS**, or
 **XYZ** basemap over a chosen rectangular extent.
