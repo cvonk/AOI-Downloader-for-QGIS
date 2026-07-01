@@ -431,6 +431,7 @@ class AoiDownloadTask(QgsTask):
 
         self.result_tif_path = None
         self.exception       = None
+        self.summary         = None      # {total, done, failed} once tiles resolve
         self.logger          = build_logger(self.work_dir)
 
     def run(self):
@@ -533,7 +534,11 @@ class AoiDownloadTask(QgsTask):
                 if processed % 25 == 0:
                     logger.info("Checkpoint %d/%d (%s)", done_n, total, c)
 
-            logger.info("All tiles resolved: %s", queue.counts())
+            final_counts = queue.counts()
+            self.summary = {"total": total,
+                            "done":   final_counts.get("done", 0),
+                            "failed": final_counts.get("failed", 0)}
+            logger.info("All tiles resolved: %s", final_counts)
             tile_paths = queue.done_file_paths()
             if not tile_paths:
                 raise DownloaderError("No tiles downloaded; cannot build mosaic.")
@@ -567,11 +572,15 @@ class AoiDownloadTask(QgsTask):
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
-        output_path=None, temporary=False):
+        output_path=None, temporary=False, on_finished=None):
     """
     Start a download task. The source backend (WMS / XYZ) is auto-detected from
     `layer`. `opts` is the source-specific settings dict
     (WMS: {tile_pixels, resolution}; XYZ: {zoom}).
+
+    `on_finished`, if given, is called on the main thread when the task ends
+    with a result dict: {success, loaded, tif, summary, error}. The plugin uses
+    it to post a completion message to the QGIS message bar.
     """
     for t in QgsApplication.taskManager().activeTasks():
         if t.description() == TASK_DESC:
@@ -612,12 +621,14 @@ def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
 
     def _finished(success):
         release_logger()
+        loaded = False
         if success and task.result_tif_path and os.path.exists(task.result_tif_path):
             layer_name = os.path.splitext(
                 os.path.basename(task.result_tif_path))[0].replace("_", " ")
             lyr = QgsRasterLayer(task.result_tif_path, layer_name)
             if lyr.isValid():
                 QgsProject.instance().addMapLayer(lyr)
+                loaded = True
                 print(f"[AOI Downloader] Mosaic loaded: {task.result_tif_path}")
             else:
                 msg = f"Mosaic file invalid: {task.result_tif_path}"
@@ -627,6 +638,19 @@ def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
             msg = str(task.exception) if task.exception else "Task failed."
             print(f"[AOI Downloader] FAILED: {msg}")
             QgsMessageLog.logMessage(f"Task failed: {msg}", LOG_TAB, Qgis.Critical)
+
+        if callable(on_finished):
+            try:
+                on_finished({
+                    "success": bool(success),
+                    "loaded":  loaded,
+                    "tif":     task.result_tif_path,
+                    "summary": task.summary or {},
+                    "error":   (str(task.exception)
+                                if (not success and task.exception) else None),
+                })
+            except Exception:
+                pass
 
     task.taskCompleted.connect(lambda: _finished(True))
     task.taskTerminated.connect(lambda: _finished(False))

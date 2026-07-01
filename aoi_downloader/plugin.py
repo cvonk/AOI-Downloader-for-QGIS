@@ -57,16 +57,34 @@ class AoiDownloaderPlugin:
             self.iface.messageBar().pushWarning(
                 MENU_TITLE, "The selected layer is not a recognised WMS or XYZ tile layer.")
             return
-        if not temporary and not output_path:
-            self.iface.messageBar().pushWarning(
-                MENU_TITLE, "Choose an output file, or select 'Temporary file'.")
-            return
 
         try:
             engine.run(layer=layer, aoi_layer=aoi_layer, opts=opts,
-                       out_crs=out_crs, output_path=output_path, temporary=temporary)
+                       out_crs=out_crs, output_path=output_path, temporary=temporary,
+                       on_finished=self._on_run_finished)
             self.iface.messageBar().pushInfo(
                 MENU_TITLE, "Download started — watch the Task Manager panel.")
         except Exception as e:
             QgsMessageLog.logMessage(str(e), "AOI Downloader", Qgis.Critical)
             self.iface.messageBar().pushCritical(MENU_TITLE, str(e))
+
+    def _on_run_finished(self, result):
+        """Post a completion summary to the message bar (runs on the main thread)."""
+        bar = self.iface.messageBar()
+        if not result.get("success"):
+            bar.pushCritical(MENU_TITLE, result.get("error") or "Download failed.")
+            return
+        s = result.get("summary") or {}
+        total, done, failed = s.get("total", 0), s.get("done", 0), s.get("failed", 0)
+        if not result.get("loaded"):
+            bar.pushWarning(
+                MENU_TITLE,
+                f"Finished, but the mosaic could not be loaded "
+                f"({done}/{total} tiles, {failed} failed).")
+        elif failed:
+            bar.pushWarning(
+                MENU_TITLE,
+                f"Mosaic loaded with {failed} failed tile(s) of {total} — see download.log.")
+        else:
+            bar.pushMessage(
+                MENU_TITLE, f"Mosaic loaded — {done} tiles.", level=Qgis.Success)
