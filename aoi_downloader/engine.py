@@ -217,8 +217,8 @@ def georeference(body, out_tif, bounds, srs, detect_empty=False):
 # ADAPTIVE THROTTLE
 # ─────────────────────────────────────────────
 class AdaptiveThrottle:
-    def __init__(self, logger):
-        self._d, self._ok, self._log = INITIAL_DELAY_SEC, 0, logger
+    def __init__(self, logger, initial_delay=INITIAL_DELAY_SEC):
+        self._d, self._ok, self._log = initial_delay, 0, logger
 
     def wait(self, cancel_check=None):
         rem = self._d
@@ -371,7 +371,8 @@ def fingerprint(source, params, opts, aoi_layer):
 # ─────────────────────────────────────────────
 # MOSAIC
 # ─────────────────────────────────────────────
-def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs):
+def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs,
+                 resample="bilinear"):
     if gdal is None:
         raise DownloaderError("GDAL Python bindings unavailable; cannot build mosaic.")
     if not tile_paths:
@@ -395,9 +396,9 @@ def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs):
 
     reproject = (out_crs and native_crs and out_crs.upper() != native_crs.upper())
     if reproject:
-        logger.info("Warp VRT → %s (%s → %s)", tif, native_crs, out_crs)
+        logger.info("Warp VRT → %s (%s → %s, resample=%s)", tif, native_crs, out_crs, resample)
         ds = gdal.Warp(tif, vrt, options=gdal.WarpOptions(
-            format="GTiff", dstSRS=out_crs, resampleAlg="bilinear",
+            format="GTiff", dstSRS=out_crs, resampleAlg=resample,
             creationOptions=creation, multithread=True))
     else:
         logger.info("Translate VRT → %s (%s)", tif, native_crs)
@@ -415,7 +416,7 @@ def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs):
 # ─────────────────────────────────────────────
 class AoiDownloadTask(QgsTask):
     def __init__(self, source, layer, aoi_layer, params, opts,
-                 native_crs, out_crs, output_path=None):
+                 native_crs, out_crs, output_path=None, resample="bilinear"):
         super().__init__(TASK_DESC, QgsTask.CanCancel)
         self._source       = source
         self._params       = params
@@ -424,6 +425,7 @@ class AoiDownloadTask(QgsTask):
         self._native_crs   = native_crs
         self._out_crs      = out_crs or native_crs
         self._output_path  = output_path or None
+        self._resample     = resample or "bilinear"
 
         project = QgsProject.instance()
         base_dir = (os.path.dirname(project.fileName())
@@ -476,8 +478,9 @@ class AoiDownloadTask(QgsTask):
             total = queue.total()
             logger.info("Queue: %s  (total=%d)", queue.counts(), total)
 
-            throttle = AdaptiveThrottle(logger)
-            self._sleep(INITIAL_DELAY_SEC)
+            initial_delay = getattr(self._source, "INITIAL_DELAY_SEC", INITIAL_DELAY_SEC)
+            throttle = AdaptiveThrottle(logger, initial_delay)
+            self._sleep(initial_delay)
 
             tiles_dir = os.path.join(self.work_dir, "tiles")
             # In-memory work list seeded from the queue; retries are re-appended.
@@ -551,7 +554,7 @@ class AoiDownloadTask(QgsTask):
 
             vrt_path, tif_path = build_mosaic(
                 tile_paths, self.work_dir, logger, self._output_path,
-                self._native_crs, self._out_crs)
+                self._native_crs, self._out_crs, self._resample)
             self.result_tif_path = tif_path
 
             if CLEANUP_TILES_AFTER_MOSAIC:
@@ -596,7 +599,7 @@ class AoiDownloadTask(QgsTask):
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
-        output_path=None, temporary=False, on_finished=None):
+        output_path=None, temporary=False, resample="bilinear", on_finished=None):
     """
     Start a download task. The source backend (WMS / XYZ) is auto-detected from
     `layer`. `opts` is the source-specific settings dict
@@ -631,6 +634,9 @@ def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
     opts = opts or {}
     native = source.native_crs(params, opts)
     out_crs = out_crs or source.default_out_crs(params)
+    resample = resample or "bilinear"
+    if resample == "none":
+        out_crs = native            # no reprojection → no resampling
 
     if temporary:
         from qgis.core import QgsProcessingUtils
@@ -641,7 +647,7 @@ def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
     print(f"[AOI Downloader] Native : {native}   Output CRS: {out_crs}")
 
     task = AoiDownloadTask(source, layer, aoi_layer, params, opts,
-                           native, out_crs, output_path)
+                           native, out_crs, output_path, resample)
 
     def _finished(success):
         release_logger()

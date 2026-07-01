@@ -1,5 +1,7 @@
 # AOI Downloader for QGIS
 
+[![CI](https://github.com/cvonk/AOI-Downloader-for-QGIS/actions/workflows/ci.yml/badge.svg)](https://github.com/cvonk/AOI-Downloader-for-QGIS/actions/workflows/ci.yml)
+
 A QGIS plugin that exports a high-resolution GeoTIFF from a **WMS** or **XYZ**
 basemap, clipped to a polygon area of interest (AOI).
 

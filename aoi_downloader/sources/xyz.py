@@ -17,6 +17,7 @@ from ..tilemath import (
 )
 
 SOURCE_NAME = "XYZ"
+INITIAL_DELAY_SEC = 0.25       # tile servers usually tolerate a faster start
 
 WEBMERC = "EPSG:3857"
 

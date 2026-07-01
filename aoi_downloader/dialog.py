@@ -12,7 +12,7 @@ import math
 from qgis.PyQt.QtWidgets import (
     QDialog, QFormLayout, QVBoxLayout, QHBoxLayout, QDialogButtonBox,
     QSpinBox, QDoubleSpinBox, QLabel, QWidget, QLineEdit, QToolButton,
-    QMenu, QFileDialog, QMessageBox,
+    QMenu, QFileDialog, QMessageBox, QComboBox,
 )
 from qgis.core import (
     QgsProject, QgsMapLayerProxyModel, QgsRasterLayer, QgsSettings,
@@ -135,6 +135,14 @@ class AoiDialog(QDialog):
         self.crs_widget = QgsProjectionSelectionWidget()
         form.addRow("Output CRS:", self.crs_widget)
 
+        self.resample_combo = QComboBox()
+        self.resample_combo.addItem("Bilinear", "bilinear")
+        self.resample_combo.addItem("Nearest neighbour", "near")
+        self.resample_combo.addItem("Cubic", "cubic")
+        self.resample_combo.addItem("None (keep native CRS, no reprojection)", "none")
+        self.resample_combo.currentIndexChanged.connect(self._sync_resample)
+        form.addRow("Reproject sampling:", self.resample_combo)
+
         self.out_widget = OutputDestinationWidget()
         form.addRow("Output:", self.out_widget)
 
@@ -155,6 +163,7 @@ class AoiDialog(QDialog):
         self._restore_state()
         self._on_layer_changed()
         self._update_estimate()
+        self._sync_resample()
 
     # ── filtering / visibility ────────────────────────────────────────────────
     def _restrict_to_sources(self):
@@ -245,6 +254,10 @@ class AoiDialog(QDialog):
         self.estimate_lbl.setText(
             "" if n is None else f"≈ {n:,} tiles (bounding-box estimate)")
 
+    def _sync_resample(self, *args):
+        # "None" keeps the native CRS, so the output-CRS picker is irrelevant.
+        self.crs_widget.setEnabled(self.resample_combo.currentData() != "none")
+
     # ── settings persistence ──────────────────────────────────────────────────
     def _restore_state(self):
         s, g = QgsSettings(), SETTINGS_GROUP
@@ -257,6 +270,10 @@ class AoiDialog(QDialog):
             self.out_widget.set_file_path("")
         else:
             self.out_widget.set_file_path(s.value(f"{g}/output_path", "") or "")
+
+        r = self.resample_combo.findData(s.value(f"{g}/resample", "bilinear"))
+        if r >= 0:
+            self.resample_combo.setCurrentIndex(r)
 
         # Set the layers first (this fires _on_layer_changed, which may default
         # the output CRS to the source's native CRS)…
@@ -287,6 +304,7 @@ class AoiDialog(QDialog):
             s.setValue(f"{g}/out_crs", self.crs_widget.crs().authid())
         s.setValue(f"{g}/output_mode", "temp" if self.out_widget.is_temporary() else "file")
         s.setValue(f"{g}/output_path", self.out_widget.file_path() or "")
+        s.setValue(f"{g}/resample", self.resample_combo.currentData())
         ly, al = self.layer_combo.currentLayer(), self.aoi_combo.currentLayer()
         s.setValue(f"{g}/layer_id", ly.id() if ly else "")
         s.setValue(f"{g}/aoi_layer_id", al.id() if al else "")
@@ -320,4 +338,5 @@ class AoiDialog(QDialog):
         out_crs = crs.authid() if crs.isValid() else None
         temporary = self.out_widget.is_temporary()
         out_path = self.out_widget.file_path()
-        return (layer, aoi, opts, out_crs, out_path, temporary)
+        resample = self.resample_combo.currentData()
+        return (layer, aoi, opts, out_crs, out_path, temporary, resample)

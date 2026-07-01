@@ -13,6 +13,7 @@ from .. import engine
 from ..engine import DownloaderError, TileFetchError
 
 SOURCE_NAME = "WMS"
+INITIAL_DELAY_SEC = 1.0        # WMS servers are often stricter; start gently
 
 PREFERRED_FORMATS = [
     ["image/tiff", "geotiff", "image/geo+tiff", "application/x-geotiff"],
