@@ -20,7 +20,8 @@ A "source" module exposes:
     fingerprint_parts(params, opts) -> list
 """
 
-import os, json, sqlite3, logging, time, traceback, hashlib
+import os, json, sqlite3, logging, time, traceback, hashlib, uuid
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 
 from qgis.PyQt.QtCore   import QUrl
@@ -48,6 +49,7 @@ SPEEDUP_FACTOR           = 0.85
 SLOWDOWN_FACTOR          = 2.0
 SUCCESSES_BEFORE_SPEEDUP = 3
 REQUEST_TIMEOUT_MS       = 60_000
+CONCURRENCY              = 4       # parallel tile fetches (dispatch still paced by the throttle)
 
 CLEANUP_TILES_AFTER_MOSAIC = False
 WORK_SUBDIR_NAME = "aoi_download"
@@ -184,7 +186,7 @@ def georeference(body, out_tif, bounds, srs, detect_empty=False):
     """
     if gdal is None:
         raise DownloaderError("GDAL bindings unavailable; cannot georeference tiles.")
-    mem = f"/vsimem/aoi_tile_{id(body)}"
+    mem = f"/vsimem/aoi_tile_{uuid.uuid4().hex}"     # unique per call (thread-safe)
     gdal.FileFromMemBuffer(mem, body)
     ds = None
     try:
@@ -477,62 +479,66 @@ class AoiDownloadTask(QgsTask):
             throttle = AdaptiveThrottle(logger)
             self._sleep(INITIAL_DELAY_SEC)
 
-            processed = 0
             tiles_dir = os.path.join(self.work_dir, "tiles")
-            while True:
-                if self.isCanceled():
-                    logger.warning("Cancelled. Queue checkpointed in %s", db_path)
-                    return
-                pending = queue.pending_tiles()
-                if not pending:
-                    break
+            # In-memory work list seeded from the queue; retries are re-appended.
+            # All DB and throttle state is touched only here (this thread); the
+            # pool workers just fetch + georeference and return a result.
+            pending = [[tid, json.loads(spec), attempts]
+                       for tid, spec, attempts in queue.pending_tiles()]
+            in_flight = {}          # future -> [tid, tile, attempts]
+            processed = 0
 
-                tid, spec, attempts = pending[0]
-                tile = json.loads(spec)
-                out_path = os.path.join(tiles_dir, f"tile_{tid:06d}.tif")
-                success, last_err = False, None
-
-                while attempts < MAX_ATTEMPTS_PER_TILE:
-                    if self.isCanceled():
-                        return
-                    attempts += 1
-                    queue.mark_attempt(tid, attempts)
-                    try:
+            with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+                while (pending or in_flight) and not self.isCanceled():
+                    # Fill the pool, pacing each dispatch with the throttle so
+                    # the overall request rate stays adaptive.
+                    while pending and len(in_flight) < CONCURRENCY:
                         throttle.wait(self.isCanceled)
                         if self.isCanceled():
-                            return
-                        result = self._source.fetch_one_tile(
-                            self._params, self._opts, tile, out_path, logger)
-                        throttle.on_success()
-                        queue.mark_done(tid, result)
-                        success = True
-                        logger.info("Tile %d OK%s", tid, "" if result else " (empty/missing)")
+                            break
+                        tid, tile, attempts = pending.pop(0)
+                        attempts += 1
+                        queue.mark_attempt(tid, attempts)
+                        out_path = os.path.join(tiles_dir, f"tile_{tid:06d}.tif")
+                        fut = pool.submit(self._fetch_worker, tile, out_path)
+                        in_flight[fut] = [tid, tile, attempts]
+
+                    if not in_flight:
                         break
-                    except TileFetchError as e:
-                        last_err = e
-                        if "timed out" in str(e).lower():
-                            throttle.on_timeout()
-                        elif e.is_throttle:
-                            throttle.on_throttle(e.retry_after)
+
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        tid, tile, attempts = in_flight.pop(fut)
+                        outcome, path, retry_after, err = fut.result()
+
+                        if outcome in ("ok", "empty"):
+                            throttle.on_success()
+                            queue.mark_done(tid, path)
+                            logger.info("Tile %d OK%s", tid,
+                                        "" if outcome == "ok" else " (empty/missing)")
                         else:
-                            logger.warning("Tile %d attempt %d: %s", tid, attempts, e)
-                        if attempts < MAX_ATTEMPTS_PER_TILE:
-                            backoff = min(MAX_DELAY_SEC,
-                                          (2 ** (attempts - 1)) * max(throttle._d, 0.5))
-                            logger.info("Tile %d retry in %.1fs (%d/%d)",
-                                        tid, backoff, attempts + 1, MAX_ATTEMPTS_PER_TILE)
-                            self._sleep(backoff)
+                            if outcome == "timeout":
+                                throttle.on_timeout()
+                            elif outcome == "throttle":
+                                throttle.on_throttle(retry_after)
+                            else:
+                                logger.warning("Tile %d attempt %d: %s", tid, attempts, err)
+                            if attempts < MAX_ATTEMPTS_PER_TILE:
+                                pending.append([tid, tile, attempts])     # retry later
+                            else:
+                                logger.error("Tile %d failed permanently: %s", tid, err)
+                                queue.mark_failed(tid, err)
 
-                if not success:
-                    logger.error("Tile %d failed permanently: %s", tid, last_err)
-                    queue.mark_failed(tid, last_err)
+                        processed += 1
+                        c = queue.counts()
+                        done_n = c["done"] + c["failed"]
+                        self.setProgress(100.0 * done_n / total if total else 100.0)
+                        if processed % 25 == 0:
+                            logger.info("Checkpoint %d/%d (%s)", done_n, total, c)
 
-                processed += 1
-                c = queue.counts()
-                done_n = c["done"] + c["failed"]
-                self.setProgress(100.0 * done_n / total if total else 100.0)
-                if processed % 25 == 0:
-                    logger.info("Checkpoint %d/%d (%s)", done_n, total, c)
+            if self.isCanceled():
+                logger.warning("Cancelled. Queue checkpointed in %s", db_path)
+                return
 
             final_counts = queue.counts()
             self.summary = {"total": total,
@@ -559,6 +565,24 @@ class AoiDownloadTask(QgsTask):
         finally:
             queue.close()
             release_logger()
+
+    def _fetch_worker(self, tile, out_path):
+        """Runs in a pool thread: one fetch attempt, no DB/throttle access.
+        Returns (outcome, path, retry_after, error) where outcome is one of
+        'ok' | 'empty' | 'throttle' | 'timeout' | 'error'."""
+        try:
+            path = self._source.fetch_one_tile(
+                self._params, self._opts, tile, out_path, self.logger)
+            return ("ok" if path else "empty", path, None, None)
+        except TileFetchError as e:
+            msg = str(e)
+            if "timed out" in msg.lower():
+                return ("timeout", None, None, msg)
+            if e.is_throttle:
+                return ("throttle", None, e.retry_after, msg)
+            return ("error", None, None, msg)
+        except Exception as e:                      # unexpected → treat as error
+            return ("error", None, None, str(e))
 
     def _sleep(self, seconds):
         rem = float(seconds)
