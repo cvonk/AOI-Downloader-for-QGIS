@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+## [1.2.1] - 2026-07-01
 ### Changed
 - Renamed the plugin package folder `aoi_downloader` → `basemap_tile_downloader`
   (the installed plugin id changes accordingly). Settings are stored under a new
