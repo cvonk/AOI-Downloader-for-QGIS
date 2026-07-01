@@ -1,0 +1,7 @@
+line-length = 100
+
+[lint]
+# Pyflakes only: high-signal checks (unused imports, undefined names, unused
+# variables) without style bikeshedding. The code intentionally uses a compact
+# style (semicolons, one-line ifs) that broader rule sets would flag.
+select = ["F"]

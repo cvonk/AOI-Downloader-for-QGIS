@@ -16,7 +16,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: pip install pytest
+        run: pip install pytest ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
 
       - name: Byte-compile the plugin
         # Catches syntax errors across every module without needing QGIS

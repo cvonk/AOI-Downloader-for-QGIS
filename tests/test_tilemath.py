@@ -66,3 +66,23 @@ def test_tile_range_clamped_to_grid():
     xmin, xmax, ymin, ymax = tm.tile_range(-9e7, -9e7, 9e7, 9e7, z)
     assert (xmin, ymin) == (0, 0)
     assert (xmax, ymax) == (2 ** z - 1, 2 ** z - 1)
+
+
+def test_wms_grid_dims_exact():
+    assert tm.wms_grid_dims(1000, 500, 100) == (10, 5)
+
+
+def test_wms_grid_dims_rounds_up():
+    assert tm.wms_grid_dims(1050, 450, 100) == (11, 5)
+
+
+def test_wms_grid_dims_at_least_one():
+    assert tm.wms_grid_dims(10, 10, 100) == (1, 1)
+
+
+def test_wms_grid_dims_bad_step():
+    try:
+        tm.wms_grid_dims(100, 100, 0)
+    except ValueError:
+        return
+    assert False, "expected ValueError for step <= 0"

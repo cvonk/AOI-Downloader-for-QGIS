@@ -12,7 +12,7 @@ import math
 from qgis.PyQt.QtWidgets import (
     QDialog, QFormLayout, QVBoxLayout, QHBoxLayout, QDialogButtonBox,
     QSpinBox, QDoubleSpinBox, QLabel, QWidget, QLineEdit, QToolButton,
-    QMenu, QFileDialog, QMessageBox, QComboBox,
+    QMenu, QFileDialog, QMessageBox, QComboBox, QCheckBox,
 )
 from qgis.core import (
     QgsProject, QgsMapLayerProxyModel, QgsRasterLayer, QgsSettings,
@@ -143,6 +143,9 @@ class AoiDialog(QDialog):
         self.resample_combo.currentIndexChanged.connect(self._sync_resample)
         form.addRow("Reproject sampling:", self.resample_combo)
 
+        self.clip_check = QCheckBox("Clip output to the AOI polygon")
+        form.addRow("", self.clip_check)
+
         self.out_widget = OutputDestinationWidget()
         form.addRow("Output:", self.out_widget)
 
@@ -181,11 +184,13 @@ class AoiDialog(QDialog):
 
     def _on_layer_changed(self, *args):
         name = self._current_source_name()
-        is_wms, is_xyz = (name == "WMS"), (name == "XYZ")
+        is_wms  = (name == "WMS")
+        is_zoom = name in ("XYZ", "WMTS")       # both address tiles by zoom level
         self._set_row_visible(self.tile_lbl, self.tile_spin, is_wms)
         self._set_row_visible(self.res_lbl,  self.res_spin,  is_wms)
-        self._set_row_visible(self.zoom_lbl, self.zoom_spin, is_xyz)
-        self._set_row_visible(self.zoom_res_lbl, self.zoom_res_info, is_xyz)
+        self._set_row_visible(self.zoom_lbl, self.zoom_spin, is_zoom)
+        # The m/px note only applies to XYZ's fixed Web-Mercator grid.
+        self._set_row_visible(self.zoom_res_lbl, self.zoom_res_info, name == "XYZ")
         self._update_zoom_label()
 
         # On a source-type change, default the output CRS to that source's native.
@@ -274,6 +279,7 @@ class AoiDialog(QDialog):
         r = self.resample_combo.findData(s.value(f"{g}/resample", "bilinear"))
         if r >= 0:
             self.resample_combo.setCurrentIndex(r)
+        self.clip_check.setChecked(s.value(f"{g}/clip", False, type=bool))
 
         # Set the layers first (this fires _on_layer_changed, which may default
         # the output CRS to the source's native CRS)…
@@ -305,6 +311,7 @@ class AoiDialog(QDialog):
         s.setValue(f"{g}/output_mode", "temp" if self.out_widget.is_temporary() else "file")
         s.setValue(f"{g}/output_path", self.out_widget.file_path() or "")
         s.setValue(f"{g}/resample", self.resample_combo.currentData())
+        s.setValue(f"{g}/clip", self.clip_check.isChecked())
         ly, al = self.layer_combo.currentLayer(), self.aoi_combo.currentLayer()
         s.setValue(f"{g}/layer_id", ly.id() if ly else "")
         s.setValue(f"{g}/aoi_layer_id", al.id() if al else "")
@@ -330,7 +337,7 @@ class AoiDialog(QDialog):
         if name == "WMS":
             opts = {"tile_pixels": self.tile_spin.value(),
                     "resolution":  self.res_spin.value()}
-        elif name == "XYZ":
+        elif name in ("XYZ", "WMTS"):
             opts = {"zoom": self.zoom_spin.value()}
         else:
             opts = {}
@@ -339,4 +346,5 @@ class AoiDialog(QDialog):
         temporary = self.out_widget.is_temporary()
         out_path = self.out_widget.file_path()
         resample = self.resample_combo.currentData()
-        return (layer, aoi, opts, out_crs, out_path, temporary, resample)
+        clip = self.clip_check.isChecked()
+        return (layer, aoi, opts, out_crs, out_path, temporary, resample, clip)

@@ -50,3 +50,11 @@ def tile_range(minx, miny, maxx, maxy, z):
     ymin = clamp(int(math.floor((WM_ORIGIN - maxy) / span)))
     ymax = clamp(int(math.floor((WM_ORIGIN - miny) / span)))
     return xmin, xmax, ymin, ymax
+
+
+def wms_grid_dims(width, height, step):
+    """Number of (cols, rows) of `step`-sized tiles covering a width×height
+    bounding box, at least 1 each. Used by the WMS backend."""
+    if step <= 0:
+        raise ValueError("step must be > 0")
+    return (max(1, math.ceil(width / step)), max(1, math.ceil(height / step)))

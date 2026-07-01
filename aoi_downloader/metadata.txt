@@ -13,4 +13,8 @@ icon=icon.svg
 experimental=False
 deprecated=False
 category=Web
-tags=wms,xyz,tiles,download,raster,mosaic,gdal,basemap,orthophoto,aoi,web mercator
+tags=wms,wmts,xyz,tiles,download,raster,mosaic,gdal,basemap,orthophoto,aoi,web mercator
+changelog=1.0.0 - Combined WMS + XYZ download to clipped GeoTIFF: auto-detected
+    source, resumable queue, adaptive per-source throttling, parallel fetching,
+    GDAL mosaic with selectable resampling/optional reprojection, tile-count
+    estimate, and completion feedback. See CHANGELOG.md for details.

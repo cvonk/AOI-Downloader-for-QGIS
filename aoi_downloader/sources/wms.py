@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """WMS source backend for the AOI Downloader (GetMap over an AOI bbox)."""
 
-import math, urllib.parse
+import urllib.parse
 import xml.etree.ElementTree as ET
 
 from qgis.core import (
@@ -11,6 +11,7 @@ from qgis.core import (
 
 from .. import engine
 from ..engine import DownloaderError, TileFetchError
+from ..tilemath import wms_grid_dims
 
 SOURCE_NAME = "WMS"
 INITIAL_DELAY_SEC = 1.0        # WMS servers are often stricter; start gently
@@ -28,7 +29,11 @@ def detect(layer):
     if not isinstance(layer, QgsRasterLayer) or layer.providerType() != "wms":
         return False
     uri = QgsDataSourceUri(); uri.setEncodedUri(layer.source())
-    return (uri.param("type") or "").lower() != "xyz"      # plain WMS, not XYZ
+    if (uri.param("type") or "").lower() == "xyz":
+        return False                                        # XYZ backend
+    if uri.param("tileMatrixSet"):
+        return False                                        # WMTS backend
+    return True
 
 
 def extract_params(layer):
@@ -172,8 +177,7 @@ def build_tile_grid(aoi_layer, params, opts, logger):
     if step <= 0:
         raise DownloaderError("Tile size in map units is ≤ 0 – check resolution.")
 
-    n_cols = max(1, math.ceil(bb.width()  / step))
-    n_rows = max(1, math.ceil(bb.height() / step))
+    n_cols, n_rows = wms_grid_dims(bb.width(), bb.height(), step)
     logger.info("AOI bbox (req CRS): %s", bb.toString())
     logger.info("Grid: %d×%d tiles, %.2f map-units/tile", n_cols, n_rows, step)
 

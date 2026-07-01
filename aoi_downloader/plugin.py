@@ -48,7 +48,7 @@ class AoiDownloaderPlugin:
         if not dlg.exec():
             return
 
-        layer, aoi_layer, opts, out_crs, output_path, temporary, resample = dlg.values()
+        layer, aoi_layer, opts, out_crs, output_path, temporary, resample, clip = dlg.values()
         if layer is None or aoi_layer is None:
             self.iface.messageBar().pushWarning(
                 MENU_TITLE, "Select both a WMS/XYZ source layer and an AOI polygon layer.")
@@ -61,7 +61,7 @@ class AoiDownloaderPlugin:
         try:
             engine.run(layer=layer, aoi_layer=aoi_layer, opts=opts,
                        out_crs=out_crs, output_path=output_path, temporary=temporary,
-                       resample=resample, on_finished=self._on_run_finished)
+                       resample=resample, clip=clip, on_finished=self._on_run_finished)
             self.iface.messageBar().pushInfo(
                 MENU_TITLE, "Download started — watch the Task Manager panel.")
         except Exception as e:

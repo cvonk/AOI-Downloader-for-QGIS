@@ -30,6 +30,7 @@ from qgis.PyQt.QtNetwork import QNetworkRequest
 from qgis.core import (
     Qgis, QgsProject, QgsTask, QgsApplication, QgsMessageLog,
     QgsRasterLayer, QgsBlockingNetworkRequest,
+    QgsGeometry, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
 )
 
 try:
@@ -74,8 +75,8 @@ class TileFetchError(Exception):
 # SOURCE DISPATCH  (late import to avoid a cycle)
 # ─────────────────────────────────────────────
 def _source_modules():
-    from .sources import wms, xyz
-    return (wms, xyz)
+    from .sources import wms, xyz, wmts
+    return (xyz, wmts, wms)
 
 
 def source_for(layer):
@@ -372,7 +373,7 @@ def fingerprint(source, params, opts, aoi_layer):
 # MOSAIC
 # ─────────────────────────────────────────────
 def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs,
-                 resample="bilinear"):
+                 resample="bilinear", cutline=None):
     if gdal is None:
         raise DownloaderError("GDAL Python bindings unavailable; cannot build mosaic.")
     if not tile_paths:
@@ -395,11 +396,17 @@ def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs,
                 "BLOCKXSIZE=256", "BLOCKYSIZE=256", "BIGTIFF=IF_SAFER"]
 
     reproject = (out_crs and native_crs and out_crs.upper() != native_crs.upper())
-    if reproject:
-        logger.info("Warp VRT → %s (%s → %s, resample=%s)", tif, native_crs, out_crs, resample)
-        ds = gdal.Warp(tif, vrt, options=gdal.WarpOptions(
-            format="GTiff", dstSRS=out_crs, resampleAlg=resample,
-            creationOptions=creation, multithread=True))
+    warp_alg  = "near" if resample == "none" else resample
+    # A cutline must be applied with Warp, so warp even when not reprojecting.
+    if reproject or cutline:
+        warp_kwargs = dict(format="GTiff", dstSRS=out_crs, resampleAlg=warp_alg,
+                           creationOptions=creation, multithread=True)
+        if cutline:
+            warp_kwargs.update(cutlineDSName=cutline, cropToCutline=True)
+        logger.info("Warp VRT → %s (%s → %s, resample=%s%s)",
+                    tif, native_crs, out_crs, warp_alg,
+                    ", clip=AOI" if cutline else "")
+        ds = gdal.Warp(tif, vrt, options=gdal.WarpOptions(**warp_kwargs))
     else:
         logger.info("Translate VRT → %s (%s)", tif, native_crs)
         ds = gdal.Translate(tif, vrt, options=gdal.TranslateOptions(
@@ -416,7 +423,8 @@ def build_mosaic(tile_paths, work_dir, logger, tif_path, native_crs, out_crs,
 # ─────────────────────────────────────────────
 class AoiDownloadTask(QgsTask):
     def __init__(self, source, layer, aoi_layer, params, opts,
-                 native_crs, out_crs, output_path=None, resample="bilinear"):
+                 native_crs, out_crs, output_path=None, resample="bilinear",
+                 clip=False):
         super().__init__(TASK_DESC, QgsTask.CanCancel)
         self._source       = source
         self._params       = params
@@ -426,6 +434,7 @@ class AoiDownloadTask(QgsTask):
         self._out_crs      = out_crs or native_crs
         self._output_path  = output_path or None
         self._resample     = resample or "bilinear"
+        self._clip         = bool(clip)
 
         project = QgsProject.instance()
         base_dir = (os.path.dirname(project.fileName())
@@ -462,6 +471,9 @@ class AoiDownloadTask(QgsTask):
         prepare = getattr(self._source, "prepare", None)
         if callable(prepare):
             prepare(self._params, self._opts, logger)
+            # A backend may resolve its native CRS during prepare (e.g. WMTS
+            # reads it from the capabilities), so refresh it now.
+            self._native_crs = self._source.native_crs(self._params, self._opts)
 
         tiles = self._source.build_tile_grid(aoi_layer, self._params, self._opts, logger)
         fp = fingerprint(self._source, self._params, self._opts, aoi_layer)
@@ -552,9 +564,10 @@ class AoiDownloadTask(QgsTask):
             if not tile_paths:
                 raise DownloaderError("No tiles downloaded; cannot build mosaic.")
 
+            cutline = self._build_cutline(aoi_layer, logger) if self._clip else None
             vrt_path, tif_path = build_mosaic(
                 tile_paths, self.work_dir, logger, self._output_path,
-                self._native_crs, self._out_crs, self._resample)
+                self._native_crs, self._out_crs, self._resample, cutline)
             self.result_tif_path = tif_path
 
             if CLEANUP_TILES_AFTER_MOSAIC:
@@ -568,6 +581,46 @@ class AoiDownloadTask(QgsTask):
         finally:
             queue.close()
             release_logger()
+
+    def _build_cutline(self, aoi_layer, logger):
+        """Write the AOI polygon (reprojected to the output CRS) to a GeoPackage
+        for use as a gdal.Warp cutline. Returns the path, or None on failure."""
+        try:
+            from osgeo import ogr, osr
+            target = QgsCoordinateReferenceSystem(self._out_crs)
+            ctx = QgsProject.instance().transformContext()
+            xform = (None if aoi_layer.crs() == target
+                     else QgsCoordinateTransform(aoi_layer.crs(), target, ctx))
+            geoms = []
+            for feat in aoi_layer.getFeatures():
+                g = QgsGeometry(feat.geometry())
+                if g.isNull() or g.isEmpty():
+                    continue
+                if xform and g.transform(xform) != 0:
+                    continue
+                geoms.append(g)
+            if not geoms:
+                return None
+            wkt = QgsGeometry.unaryUnion(geoms).asWkt()
+
+            path = os.path.join(self.work_dir, "cutline.gpkg")
+            if os.path.exists(path):
+                try: os.remove(path)
+                except OSError: pass
+            srs = osr.SpatialReference(); srs.SetFromUserInput(self._out_crs)
+            ds  = ogr.GetDriverByName("GPKG").CreateDataSource(path)
+            lyr = ds.CreateLayer("cutline", srs, ogr.wkbMultiPolygon)
+            geom = ogr.CreateGeometryFromWkt(wkt)
+            if geom.GetGeometryName() == "POLYGON":
+                geom = ogr.ForceToMultiPolygon(geom)
+            f = ogr.Feature(lyr.GetLayerDefn()); f.SetGeometry(geom)
+            lyr.CreateFeature(f)
+            f = lyr = ds = None
+            logger.info("Cutline written → %s", path)
+            return path
+        except Exception as e:
+            logger.warning("Could not build cutline; skipping clip: %s", e)
+            return None
 
     def _fetch_worker(self, tile, out_path):
         """Runs in a pool thread: one fetch attempt, no DB/throttle access.
@@ -599,7 +652,8 @@ class AoiDownloadTask(QgsTask):
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
-        output_path=None, temporary=False, resample="bilinear", on_finished=None):
+        output_path=None, temporary=False, resample="bilinear", clip=False,
+        on_finished=None):
     """
     Start a download task. The source backend (WMS / XYZ) is auto-detected from
     `layer`. `opts` is the source-specific settings dict
@@ -647,7 +701,7 @@ def run(layer=None, aoi_layer=None, opts=None, out_crs=None,
     print(f"[AOI Downloader] Native : {native}   Output CRS: {out_crs}")
 
     task = AoiDownloadTask(source, layer, aoi_layer, params, opts,
-                           native, out_crs, output_path, resample)
+                           native, out_crs, output_path, resample, clip)
 
     def _finished(success):
         release_logger()
