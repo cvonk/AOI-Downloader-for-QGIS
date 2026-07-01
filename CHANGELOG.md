@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+## [1.1.1] - 2026-06-30
 ### Changed
 - The large-download confirmation now also warns about respecting the
   provider's Terms of Service when many tiles are requested.
