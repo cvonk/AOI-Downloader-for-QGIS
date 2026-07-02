@@ -5,6 +5,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-01
+### Added
+- The dialog now remembers the last-used extent (North/South/East/West and its
+  CRS) and restores it the next time it opens.
+### Changed
+- The extent widget now uses the expanded (multi-field) layout instead of the
+  condensed single line, which was unreadable in locales that use a comma as the
+  decimal separator. It sits in a collapsible "Extent to render" group (open by
+  default).
+- Renamed the per-job working folder (SQLite queue + downloaded tiles) to
+  `btd_cache/` (was `basemap_tile_downloader/` in 1.3.0).
+- Suppressed QGIS's own task-finished/terminated notification (`QgsTask.Silent`);
+  the plugin already posts its own completion and error messages, so QGIS's
+  generic one was redundant noise after a failure.
+### Fixed
+- Throttle (HTTP 429/403/503) and timeout responses are now treated as
+  back-pressure: the run slows down and the tile is retried on a separate,
+  larger retry budget instead of spending its error budget, so sustained
+  rate-limiting no longer marks otherwise-good tiles as permanently failed. The
+  back-pressure budget is still bounded so a server that refuses forever can't
+  loop indefinitely.
+- A server-directed `Retry-After` is now honoured (as a bounded one-shot wait,
+  up to 300 s) rather than being clamped to the 60 s adaptive-backoff cap, so we
+  wait as long as the server asks instead of retrying too early and getting
+  re-throttled. The wait remains cancelable from the Task Manager.
+
 ## [1.3.0] - 2026-07-01
 ### Changed
 - Raised `qgisMinimumVersion` to 3.40.8 (the version the plugin is developed and

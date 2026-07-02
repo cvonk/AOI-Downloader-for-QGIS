@@ -15,7 +15,7 @@ from qgis.PyQt.QtWidgets import (
     QMenu, QFileDialog, QMessageBox, QComboBox, QCheckBox,
 )
 from qgis.core import (
-    QgsProject, QgsMapLayerProxyModel, QgsRasterLayer, QgsSettings,
+    QgsProject, QgsMapLayerProxyModel, QgsRasterLayer, QgsSettings, QgsRectangle,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
 )
 from qgis.gui import (
@@ -104,17 +104,28 @@ class BasemapTileDialog(QDialog):
         self.layer_combo.layerChanged.connect(self._on_layer_changed)
         form.addRow("Source layer (WMS/WMTS/XYZ):", self.layer_combo)
 
-        # Extent selector like the "Convert Map to Raster" dialog. The condensed
-        # style is the single line + dropdown (Calculate from Layer / Use Current
-        # Map Canvas Extent / Draw on Canvas); the default expanded style does
-        # not surface "Draw on Canvas".
-        self.extent_widget = QgsExtentWidget(None, QgsExtentWidget.CondensedStyle)
+        # Extent selector like QGIS's "Convert Map to Raster" dialog: a dropdown
+        # (Calculate from Layer / Use Current Map Canvas Extent / …) plus the
+        # extent coordinates. Use the default expanded style, which lays the four
+        # coordinates out in separate, clearly-labelled fields. The condensed
+        # style packs them onto one comma-separated line that is unreadable in
+        # locales using a comma decimal separator, and the "Draw on Canvas"
+        # option it was chosen for has since been removed.
+        self.extent_widget = QgsExtentWidget(None, QgsExtentWidget.ExpandedStyle)
         if self._canvas is not None:
             self.extent_widget.setMapCanvas(self._canvas, True)
         self.extent_widget.setOutputCrs(QgsProject.instance().crs())
         self.extent_widget.extentChanged.connect(self._update_estimate)
         self.extent_widget.extentChanged.connect(self._update_zoom_label)
-        form.addRow("Extent to render:", self.extent_widget)
+
+        # Wrap the extent selector in a collapsible group (open by default) so it
+        # can be folded away once the extent is set.
+        extent_group = QgsCollapsibleGroupBox("Extent to render")
+        extent_group.setCollapsed(False)
+        extent_layout = QVBoxLayout(extent_group)
+        extent_layout.setContentsMargins(6, 6, 6, 6)
+        extent_layout.addWidget(self.extent_widget)
+        form.addRow(extent_group)
 
         self.clip_check = QCheckBox("Crop output to the exact extent")
         form.addRow("", self.clip_check)
@@ -361,6 +372,21 @@ class BasemapTileDialog(QDialog):
             self.crs_widget.setCrs(QgsCoordinateReferenceSystem(out_crs))
         self.conc_spin.setValue(int(s.value(f"{g}/concurrency", DEFAULT_CONCURRENCY)))
         self.attempts_spin.setValue(int(s.value(f"{g}/max_attempts", DEFAULT_MAX_ATTEMPTS)))
+
+        # Restore the last-used extent (overriding the default canvas extent that
+        # setMapCanvas seeded). setOutputExtentFromUser fills the N/S/E/W fields.
+        ext_str = s.value(f"{g}/extent", "")
+        ext_crs = s.value(f"{g}/extent_crs", "")
+        if ext_str and ext_crs:
+            try:
+                xmin, ymin, xmax, ymax = (float(v) for v in ext_str.split(","))
+                crs = QgsCoordinateReferenceSystem(ext_crs)
+                if crs.isValid():
+                    self.extent_widget.setOutputExtentFromUser(
+                        QgsRectangle(xmin, ymin, xmax, ymax), crs)
+            except (ValueError, TypeError):
+                pass
+
         self._last_source = self._current_source_name()
 
     def _save_state(self):
@@ -378,6 +404,15 @@ class BasemapTileDialog(QDialog):
         s.setValue(f"{g}/max_attempts", self.attempts_spin.value())
         ly = self.layer_combo.currentLayer()
         s.setValue(f"{g}/layer_id", ly.id() if ly else "")
+
+        # Remember the extent (in its own CRS) so it is restored next time.
+        if self.extent_widget.isValid():
+            ext = self.extent_widget.outputExtent()
+            crs = self.extent_widget.outputCrs()
+            if not ext.isEmpty() and crs.isValid():
+                s.setValue(f"{g}/extent", "{},{},{},{}".format(
+                    ext.xMinimum(), ext.yMinimum(), ext.xMaximum(), ext.yMaximum()))
+                s.setValue(f"{g}/extent_crs", crs.authid() or crs.toWkt())
 
     def accept(self):
         n = self._estimate_tiles()

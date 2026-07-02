@@ -44,9 +44,16 @@ except ImportError:
 # CONFIG
 # ─────────────────────────────────────────────
 MAX_ATTEMPTS_PER_TILE    = 6
+# Throttle/timeout responses are back-pressure, not the tile's fault, so they
+# get their own (larger) retry budget instead of burning the error budget above.
+# Still bounded, so a server that returns 429/403 forever can't loop indefinitely.
+MAX_BACKPRESSURE_RETRIES = 20
 INITIAL_DELAY_SEC        = 0.5
 MIN_DELAY_SEC            = 0.05
-MAX_DELAY_SEC            = 60.0
+MAX_DELAY_SEC            = 60.0    # ceiling for our *adaptive* (guessed) backoff
+RETRY_AFTER_MAX_SEC      = 300.0   # ceiling for a *server-directed* Retry-After wait
+                                   # (honoured beyond the adaptive cap, but bounded so
+                                   # an absurd value can't stall the run indefinitely)
 SPEEDUP_FACTOR           = 0.85
 SLOWDOWN_FACTOR          = 2.0
 SUCCESSES_BEFORE_SPEEDUP = 3
@@ -56,7 +63,7 @@ CONCURRENCY              = 4       # default parallel tile fetches; a source may
                                    # dialog lets the user set it per run
 
 CLEANUP_TILES_AFTER_MOSAIC = False
-WORK_SUBDIR_NAME = "basemap_tile_downloader"
+WORK_SUBDIR_NAME = "btd_cache"
 LOG_TAB          = "Basemap Tile Downloader"
 TASK_DESC        = "Basemap tile download"
 
@@ -241,9 +248,11 @@ def georeference(body, out_tif, bounds, srs, detect_empty=False):
 class AdaptiveThrottle:
     def __init__(self, logger, initial_delay=INITIAL_DELAY_SEC):
         self._d, self._ok, self._log = initial_delay, 0, logger
+        self._extra = 0.0     # one-shot wait honouring a server-directed Retry-After
 
     def wait(self, cancel_check=None):
-        rem = self._d
+        rem = self._d + self._extra     # consume any one-shot Retry-After wait
+        self._extra = 0.0
         while rem > 0:
             if cancel_check and cancel_check():
                 return
@@ -263,9 +272,20 @@ class AdaptiveThrottle:
         self._d = new
 
     def on_throttle(self, retry_after=None):
-        new = min(MAX_DELAY_SEC,
-                  max(self._d, retry_after) if retry_after else self._d * SLOWDOWN_FACTOR)
-        self._slow(new, f"throttle retry_after={retry_after}")
+        # Adaptive (guessed) backoff is capped at MAX_DELAY_SEC.
+        new = min(MAX_DELAY_SEC, self._d * SLOWDOWN_FACTOR)
+        if retry_after and retry_after > 0:
+            # The server told us exactly how long to wait: honour it as a bounded
+            # one-shot pause. We only nudge the adaptive baseline up modestly, so
+            # the run speeds back up promptly once the rate window has passed
+            # instead of decaying down from the full Retry-After value.
+            self._extra = max(self._extra, min(RETRY_AFTER_MAX_SEC, retry_after))
+            self._ok = 0
+            self._log.warning("Throttle ↓ %.3f→%.3f + one-shot %.1fs (server Retry-After)",
+                              self._d, new, self._extra)
+            self._d = new
+        else:
+            self._slow(new, "throttle (429)")
 
     def on_timeout(self):
         self._slow(min(MAX_DELAY_SEC, self._d * SLOWDOWN_FACTOR), "timeout")
@@ -455,7 +475,15 @@ class BasemapTileDownloadTask(QgsTask):
                  native_crs, out_crs, output_path=None, resample="bilinear",
                  clip=False, concurrency=CONCURRENCY,
                  max_attempts=MAX_ATTEMPTS_PER_TILE):
-        super().__init__(TASK_DESC, QgsTask.CanCancel)
+        # Silent: suppress QGIS's own task-finished/terminated notifications — the
+        # plugin posts its own completion (and error) messages, so QGIS's generic
+        # one is just noise, especially after a failure. (Silent needs QGIS 3.26+;
+        # guarded in case it's absent.)
+        flags = QgsTask.CanCancel
+        silent = getattr(QgsTask, "Silent", None)
+        if silent is not None:
+            flags |= silent
+        super().__init__(TASK_DESC, flags)
         self._source       = source
         self._params       = params
         self._opts         = opts
@@ -468,6 +496,7 @@ class BasemapTileDownloadTask(QgsTask):
         self._clip         = bool(clip)
         self._concurrency  = max(1, int(concurrency))
         self._max_attempts = max(1, int(max_attempts))
+        self._max_backpressure = MAX_BACKPRESSURE_RETRIES
 
         project = QgsProject.instance()
         base_dir = (os.path.dirname(project.fileName())
@@ -533,9 +562,12 @@ class BasemapTileDownloadTask(QgsTask):
             # In-memory work queue seeded from the DB; retries are re-appended.
             # All DB and throttle state is touched only here (this thread); the
             # pool workers just fetch + georeference and return a result.
-            pending = deque([tid, json.loads(spec), attempts]
+            # Each work item is [tid, tile, attempts, backpressure]: `attempts`
+            # counts genuine errors (persisted in the DB, survives a resume);
+            # `backpressure` counts throttle/timeout retries (in-memory, per run).
+            pending = deque([tid, json.loads(spec), attempts, 0]
                             for tid, spec, attempts in queue.pending_tiles())
-            in_flight = {}          # future -> [tid, tile, attempts]
+            in_flight = {}          # future -> [tid, tile, attempts, backpressure]
             processed = 0
             # Track resolved counts in memory (seeded from any resumed run's
             # already-'done' tiles) instead of re-querying SQLite per tile.
@@ -552,19 +584,17 @@ class BasemapTileDownloadTask(QgsTask):
                         throttle.wait(self.isCanceled)
                         if self.isCanceled():
                             break
-                        tid, tile, attempts = pending.popleft()
-                        attempts += 1
-                        queue.mark_attempt(tid, attempts)
+                        tid, tile, attempts, backpressure = pending.popleft()
                         out_path = os.path.join(tiles_dir, f"tile_{tid:06d}.tif")
                         fut = pool.submit(self._fetch_worker, tile, out_path)
-                        in_flight[fut] = [tid, tile, attempts]
+                        in_flight[fut] = [tid, tile, attempts, backpressure]
 
                     if not in_flight:
                         break
 
                     done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                     for fut in done:
-                        tid, tile, attempts = in_flight.pop(fut)
+                        tid, tile, attempts, backpressure = in_flight.pop(fut)
                         outcome, path, retry_after, err = fut.result()
 
                         if outcome in ("ok", "empty"):
@@ -573,15 +603,28 @@ class BasemapTileDownloadTask(QgsTask):
                             done_count += 1
                             logger.info("Tile %d OK%s", tid,
                                         "" if outcome == "ok" else " (empty/missing)")
-                        else:
+                        elif outcome in ("throttle", "timeout"):
+                            # Back-pressure: slow the whole run down and retry the
+                            # tile without spending its error budget (the tile
+                            # itself is fine — the server is rate-limiting us).
                             if outcome == "timeout":
                                 throttle.on_timeout()
-                            elif outcome == "throttle":
-                                throttle.on_throttle(retry_after)
                             else:
-                                logger.warning("Tile %d attempt %d: %s", tid, attempts, err)
+                                throttle.on_throttle(retry_after)
+                            backpressure += 1
+                            if backpressure <= self._max_backpressure:
+                                pending.append([tid, tile, attempts, backpressure])
+                            else:
+                                logger.error("Tile %d gave up after %d throttle/timeout "
+                                             "retries: %s", tid, backpressure, err)
+                                queue.mark_failed(tid, err)
+                                failed_count += 1
+                        else:
+                            attempts += 1
+                            queue.mark_attempt(tid, attempts)
+                            logger.warning("Tile %d attempt %d: %s", tid, attempts, err)
                             if attempts < self._max_attempts:
-                                pending.append([tid, tile, attempts])     # retry later
+                                pending.append([tid, tile, attempts, backpressure])
                             else:
                                 logger.error("Tile %d failed permanently: %s", tid, err)
                                 queue.mark_failed(tid, err)
